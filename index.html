@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>법률 정보 검색</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif; }
+    .article-text { white-space: pre-wrap; word-break: keep-all; }
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: #f8fafc; }
+    ::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 4px; }
+  </style>
+</head>
+<body class="bg-gray-50">
+  <div id="root"></div>
+  <script type="text/babel">
+/**
+ * 법률 정보 검색 웹 앱
+ * 팀: UI 조교 → API 조교 → UX 조교 (Agentic Workflow)
+ * 사용 MCP: korean-law-mcp (https://korean-law-mcp.fly.dev/mcp)
+ * 필요: Anthropic API 키 + 법제처 OC 인증키 (https://open.law.go.kr 에서 발급)
+ * 주의: 프로덕션 환경에서는 백엔드 프록시를 통해 API를 호출하세요 (보안/CORS)
+ */
+
+const { useState, useRef } = React;
+
+// ── 상수 ─────────────────────────────────────────────────────
+const API_URL  = 'https://api.anthropic.com/v1/messages';
+const MCP_URL  = 'https://korean-law-mcp.fly.dev/mcp';
+const MODEL    = 'claude-sonnet-4-20250514';
+const TIMEOUT  = 30_000;
+const QUICK_SEARCHES = ['임대차보호법', '근로기준법', '형법', '민법', '상법'];
+const SYSTEM_PROMPT =
+  '당신은 대한민국 법령 검색 전문가입니다. 제공된 MCP 도구를 사용하여 사용자 요청에 응답하세요. ' +
+  '결과는 설명 텍스트 없이 JSON만 반환하세요.';
+
+// ── 파싱 유틸리티 ─────────────────────────────────────────────
+function extractJson(text) {
+  try { const m = text.match(/```(?:json)?\s*([\s\S]+?)\s*```/); return JSON.parse(m ? m[1] : text); }
+  catch { return null; }
+}
+
+function parseMcpToolResults(data) {
+  if (!data?.content) return null;
+  for (const b of data.content) {
+    if (b.type === 'mcp_tool_result' || b.type === 'tool_result') {
+      const items = Array.isArray(b.content) ? b.content : [{ type: 'text', text: b.output || '' }];
+      for (const item of items) {
+        if (item.type === 'text') { const p = extractJson(item.text); if (p) return p; }
+      }
+    }
+  }
+  for (const b of data.content) {
+    if (b.type === 'text') { const p = extractJson(b.text); return p || { rawText: b.text }; }
+  }
+  return null;
+}
+
+function normalizeSearchResults(raw) {
+  if (!raw) return [];
+  const items = Array.isArray(raw) ? raw : raw.results || raw.laws || raw.items || [];
+  return items.map((it, i) => ({
+    id:             it.law_id   || it.lawId   || `r-${i}`,
+    lawName:        it.law_name || it.lawName || it.name || '(법령명 없음)',
+    articleNo:      it.article_no || it.articleNo || it.article || '',
+    summary:        it.summary || it.description || it.content || '',
+    precedentCount: it.precedent_count || it.precedentCount || 0,
+    raw: it,
+  }));
+}
+
+function normalizeArticle(raw, fb) {
+  if (!raw) return fb
+    ? { lawName: fb.lawName, articleNo: fb.articleNo, articleTitle: '', text: fb.summary || '조문 원문을 불러올 수 없습니다.' }
+    : null;
+  if (raw.rawText) return { lawName: fb?.lawName || '법령', articleNo: fb?.articleNo || '', articleTitle: '', text: raw.rawText };
+  return {
+    lawName:      raw.law_name  || raw.lawName  || fb?.lawName  || '법령',
+    articleNo:    raw.article_no || raw.articleNo || fb?.articleNo || '',
+    articleTitle: raw.article_title || raw.articleTitle || raw.title || '',
+    text:         raw.content   || raw.text     || raw.article_text || '조문 내용 없음',
+  };
+}
+
+function normalizePrecedents(raw) {
+  if (!raw) return [];
+  const items = Array.isArray(raw) ? raw : raw.precedents || raw.cases || raw.results || [];
+  return items.map((it, i) => ({
+    id:      it.case_id  || `p-${i}`,
+    court:   it.court    || '법원',
+    date:    it.date     || it.decision_date || '',
+    caseNo:  it.case_no  || it.caseNo || '',
+    summary: it.summary  || it.title  || '',
+    content: it.content  || it.full_text || '',
+  }));
+}
+
+// ── 로딩 스피너 ───────────────────────────────────────────────
+function LoadingSpinner({ text = '불러오는 중...' }) {
+  return (
+    <div className="flex flex-col items-center justify-center py-12" role="status" aria-label={text}>
+      <div className="w-9 h-9 border-4 border-indigo-100 border-t-indigo-700 rounded-full animate-spin" />
+      <p className="mt-3 text-indigo-700 text-sm font-medium">{text}</p>
+    </div>
+  );
+}
+
+// ── 빈 결과 안내 ──────────────────────────────────────────────
+function EmptyState({ query, onQuickSearch }) {
+  return (
+    <div className="flex flex-col items-center justify-center py-12 text-center px-4">
+      <svg className="w-14 h-14 text-gray-200 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+          d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+      </svg>
+      {query
+        ? <><p className="text-gray-700 font-medium text-sm mb-1">"{query}"에 대한 검색 결과가 없습니다.</p>
+            <p className="text-gray-400 text-xs mb-5">검색어를 바꾸거나 아래 예시를 선택해보세요.</p></>
+        : <p className="text-gray-400 text-sm mb-5">검색어를 입력하여 법령을 검색하세요.</p>
+      }
+      <div className="flex flex-wrap gap-2 justify-center">
+        {QUICK_SEARCHES.map(q => (
+          <button key={q} onClick={() => onQuickSearch(q)}
+            className="min-h-[44px] px-4 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-full text-sm border border-indigo-200 transition-colors">
+            {q}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── 에러 메시지 ───────────────────────────────────────────────
+function ErrorMessage({ error, onRetry, onGoSettings }) {
+  return (
+    <div className="m-2 p-4 bg-red-50 border border-red-200 rounded-lg" role="alert">
+      <div className="flex items-start gap-3">
+        <svg className="w-5 h-5 text-red-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+            d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+        <div>
+          <p className="text-red-700 font-semibold text-sm">오류 발생</p>
+          <p className="text-red-600 text-sm mt-1">{error?.message || '알 수 없는 오류'}</p>
+          {error?.code && <p className="text-red-400 text-xs mt-1">코드: {error.code}</p>}
+        </div>
+      </div>
+      {error?.type === 'TIMEOUT' && onRetry && (
+        <button onClick={onRetry}
+          className="mt-3 w-full min-h-[40px] bg-red-100 hover:bg-red-200 text-red-700 rounded-md text-sm font-medium transition-colors">
+          다시 시도
+        </button>
+      )}
+      {(error?.type === 'MISSING_OC_KEY' || error?.type === 'MISSING_ANTHROPIC_KEY') && onGoSettings && (
+        <button onClick={onGoSettings}
+          className="mt-3 w-full min-h-[40px] bg-amber-100 hover:bg-amber-200 text-amber-700 rounded-md text-sm font-medium transition-colors">
+          API 설정 열기 →
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ── 설정 패널 ─────────────────────────────────────────────────
+function SettingsPanel({ anthropicKey, ocKey, onChange, isOpen, onToggle, panelRef }) {
+  const hasKeys = anthropicKey && ocKey;
+  return (
+    <div className="bg-white border-b border-gray-200 shadow-sm" ref={panelRef}>
+      <div className="max-w-5xl mx-auto px-4">
+        <button onClick={onToggle} aria-expanded={isOpen}
+          className="w-full flex items-center justify-between py-3 text-sm text-gray-600 hover:text-indigo-700 transition-colors">
+          <div className="flex items-center gap-2">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+            <span className="font-medium">API 설정</span>
+            {!hasKeys
+              ? <span className="px-2 py-0.5 bg-amber-100 text-amber-700 text-xs rounded-full">인증키 필요</span>
+              : <span className="px-2 py-0.5 bg-green-100 text-green-700 text-xs rounded-full">연결됨</span>
+            }
+          </div>
+          <svg className={`w-4 h-4 transition-transform ${isOpen ? 'rotate-180' : ''}`}
+            fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+        {isOpen && (
+          <div className="pb-4 space-y-3">
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1">
+                Anthropic API 키
+                <span className="ml-1 font-normal text-gray-400">(console.anthropic.com에서 발급)</span>
+              </label>
+              <input type="password" value={anthropicKey} onChange={e => onChange('anthropicKey', e.target.value)}
+                placeholder="sk-ant-api03-..."
+                className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono" />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1">
+                법제처 OC 인증키
+                <a href="https://open.law.go.kr" target="_blank" rel="noopener noreferrer"
+                  className="ml-1 font-normal text-indigo-600 hover:underline">(open.law.go.kr에서 무료 발급 →)</a>
+              </label>
+              <input type="password" value={ocKey} onChange={e => onChange('ocKey', e.target.value)}
+                placeholder="법제처 OC 인증키 입력"
+                className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+              <p className="text-xs text-gray-400 mt-1">
+                open.law.go.kr 접속 → 로그인 → 마이페이지 → 오픈API 신청 → OC키 발급
+              </p>
+            </div>
+            <p className="text-xs text-gray-400 bg-gray-50 rounded p-2">
+              🔒 입력한 키는 브라우저 메모리에만 저장되며 외부 서버로 전송되지 않습니다.
+            </p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── 검색창 ────────────────────────────────────────────────────
+function SearchBar({ query, onChange, onSearch, isLoading, onQuickSearch, inputRef }) {
+  return (
+    <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4 mb-4">
+      <div className="flex gap-2">
+        <div className="relative flex-1">
+          <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none"
+            fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          </svg>
+          <input ref={inputRef} type="search" value={query} onChange={e => onChange(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && !isLoading && onSearch()}
+            placeholder="예: 근로기준법, 형법 제250조, 주택임대차보호법"
+            aria-label="법령 검색어 입력"
+            className="w-full pl-10 pr-4 py-2.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+        </div>
+        <button onClick={onSearch} disabled={isLoading || !query.trim()} aria-label="검색"
+          className="px-5 py-2.5 min-h-[44px] bg-indigo-700 hover:bg-indigo-800 active:bg-indigo-900 disabled:bg-gray-300 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-lg transition-colors whitespace-nowrap">
+          {isLoading
+            ? <span className="flex items-center gap-2">
+                <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24" aria-hidden="true">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                </svg>검색 중
+              </span>
+            : '검색'
+          }
+        </button>
+      </div>
+      <div className="flex flex-wrap items-center gap-2 mt-3">
+        <span className="text-xs text-gray-400">자주 쓰는 검색어:</span>
+        {QUICK_SEARCHES.map(q => (
+          <button key={q} onClick={() => onQuickSearch(q)}
+            className="min-h-[32px] px-3 py-1 bg-slate-100 hover:bg-indigo-100 text-slate-600 hover:text-indigo-700 text-xs rounded-full border border-slate-200 hover:border-indigo-300 transition-colors">
+            {q}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── 결과 카드 ─────────────────────────────────────────────────
+function ResultCard({ result, isSelected, onClick }) {
+  return (
+    <div role="button" tabIndex={0} onClick={onClick}
+      onKeyDown={e => (e.key === 'Enter' || e.key === ' ') && onClick()}
+      aria-pressed={isSelected}
+      className={`p-4 rounded-lg border cursor-pointer transition-all focus:outline-none focus:ring-2 focus:ring-indigo-400 ${
+        isSelected ? 'border-indigo-500 bg-indigo-50' : 'border-gray-200 bg-white hover:border-indigo-300 hover:shadow-sm'
+      }`}>
+      <div className="flex items-start gap-3">
+        <div className="flex-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-1.5 mb-1.5">
+            {result.articleNo && (
+              <span className="text-xs font-bold px-2 py-0.5 bg-indigo-700 text-white rounded flex-shrink-0">
+                {result.articleNo}
+              </span>
+            )}
+            <h3 className="font-bold text-gray-900 text-sm">{result.lawName}</h3>
+          </div>
+          <p className="text-gray-500 text-xs leading-relaxed line-clamp-2">{result.summary}</p>
+        </div>
+        {result.precedentCount > 0 && (
+          <span className="flex-shrink-0 text-xs px-2 py-1 bg-amber-50 text-amber-700 border border-amber-200 rounded-full whitespace-nowrap">
+            판례 {result.precedentCount}건
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── 검색 결과 목록 ────────────────────────────────────────────
+function SearchResults({ results, selectedId, onSelect, isLoading, error, hasSearched, query, onRetry, onQuickSearch, onGoSettings }) {
+  if (isLoading) return <LoadingSpinner text="법령을 검색하고 있습니다..." />;
+  if (error) return <ErrorMessage error={error} onRetry={onRetry} onGoSettings={onGoSettings} />;
+  if (!hasSearched) return <EmptyState query="" onQuickSearch={onQuickSearch} />;
+  if (results.length === 0) return <EmptyState query={query} onQuickSearch={onQuickSearch} />;
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-gray-400">총 <strong className="text-gray-600">{results.length}건</strong>의 검색 결과</p>
+      {results.map(r => (
+        <ResultCard key={r.id} result={r} isSelected={selectedId === r.id} onClick={() => onSelect(r)} />
+      ))}
+    </div>
+  );
+}
+
+// ── 조문 원문 뷰 ──────────────────────────────────────────────
+function ArticleView({ article, isLoading }) {
+  if (isLoading) return <LoadingSpinner text="조문을 불러오는 중..." />;
+  if (!article) return (
+    <div className="flex flex-col items-center justify-center py-10 text-center">
+      <svg className="w-12 h-12 text-gray-200 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+          d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+      </svg>
+      <p className="text-gray-400 text-sm">좌측에서 법령을 선택하면<br/>조문 원문을 볼 수 있습니다.</p>
+    </div>
+  );
+  const paragraphs = (article.text || '').split(/\n{2,}/).filter(p => p.trim());
+  return (
+    <div className="space-y-4">
+      <div className="bg-indigo-50 border-l-4 border-indigo-700 rounded-r-lg p-4">
+        <h3 className="text-indigo-900 font-bold text-base leading-tight">{article.lawName}</h3>
+        {article.articleNo    && <p className="text-indigo-700 font-bold text-sm mt-1">{article.articleNo}</p>}
+        {article.articleTitle && <p className="text-indigo-600 text-sm mt-0.5">({article.articleTitle})</p>}
+      </div>
+      <div>
+        <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-2">조문 원문</p>
+        <div className="bg-gray-50 border border-gray-200 rounded-lg p-4 space-y-3">
+          {paragraphs.length > 1
+            ? paragraphs.map((p, i) => <p key={i} className="text-gray-800 text-sm leading-7 article-text">{p.trim()}</p>)
+            : <p className="text-gray-800 text-sm leading-7 article-text">{article.text}</p>
+          }
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── 판례 아이템 ───────────────────────────────────────────────
+function PrecedentItem({ prec }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="border border-gray-200 rounded-lg overflow-hidden">
+      <button onClick={() => setOpen(!open)} aria-expanded={open}
+        className="w-full text-left p-4 bg-white hover:bg-gray-50 transition-colors focus:outline-none focus:ring-2 focus:ring-inset focus:ring-indigo-400">
+        <div className="flex items-start gap-3">
+          <div className="flex-1 min-w-0">
+            <div className="flex flex-wrap items-center gap-1.5 mb-1.5">
+              <span className="text-xs font-bold px-2 py-0.5 bg-blue-900 text-white rounded">{prec.court}</span>
+              <span className="text-xs text-gray-400">{prec.date}</span>
+              <span className="text-xs text-gray-400 font-mono">{prec.caseNo}</span>
+            </div>
+            <p className="text-gray-700 text-sm font-medium line-clamp-2 leading-relaxed">{prec.summary}</p>
+          </div>
+          <svg className={`w-4 h-4 text-gray-400 flex-shrink-0 mt-1 transition-transform ${open ? 'rotate-180' : ''}`}
+            fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+          </svg>
+        </div>
+      </button>
+      {open && prec.content && (
+        <div className="px-4 pb-4 pt-2 bg-gray-50 border-t border-gray-200">
+          <p className="text-gray-700 text-sm leading-7 whitespace-pre-wrap">{prec.content}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── 판례 뷰 ──────────────────────────────────────────────────
+function PrecedentsView({ precs, isLoading }) {
+  if (isLoading) return <LoadingSpinner text="관련 판례를 검색하는 중..." />;
+  if (!precs?.length) return (
+    <div className="py-10 text-center text-gray-400 text-sm">
+      관련 판례가 없거나, 조문을 먼저 선택해주세요.
+    </div>
+  );
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-gray-400">관련 판례 <strong className="text-gray-600">{precs.length}건</strong></p>
+      {precs.map((p, i) => <PrecedentItem key={p.id || i} prec={p} />)}
+    </div>
+  );
+}
+
+// ── 상세 패널 ─────────────────────────────────────────────────
+function DetailPanel({ article, precs, activeTab, onTabChange, isArticleLoading, isPrecsLoading }) {
+  const tabs = [
+    { key: 'article',    label: '조문 원문' },
+    { key: 'precedents', label: `관련 판례${precs.length ? ` (${precs.length})` : ''}` },
+  ];
+  return (
+    <div className="bg-white rounded-xl shadow-sm border border-gray-200 flex flex-col overflow-hidden">
+      <div className="flex border-b border-gray-200" role="tablist">
+        {tabs.map(t => (
+          <button key={t.key} role="tab" aria-selected={activeTab === t.key}
+            onClick={() => onTabChange(t.key)}
+            className={`flex-1 py-3 min-h-[44px] text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-inset focus:ring-indigo-400 ${
+              activeTab === t.key
+                ? 'text-indigo-700 border-b-2 border-indigo-700 bg-white'
+                : 'text-gray-400 hover:text-gray-600 bg-gray-50'
+            }`}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+      <div className="p-4 overflow-y-auto flex-1" style={{ minHeight: '300px', maxHeight: '65vh' }} role="tabpanel">
+        {activeTab === 'article'
+          ? <ArticleView article={article} isLoading={isArticleLoading} />
+          : <PrecedentsView precs={precs} isLoading={isPrecsLoading} />
+        }
+      </div>
+    </div>
+  );
+}
+
+// ── 메인 앱 ──────────────────────────────────────────────────
+function App() {
+  const [anthropicKey, setAnthropicKey] = useState('');
+  const [ocKey, setOcKey]               = useState('');
+  const [query, setQuery]               = useState('');
+  const [isLoading, setIsLoading]       = useState(false);
+  const [error, setError]               = useState(null);
+  const [results, setResults]           = useState([]);
+  const [selectedId, setSelectedId]     = useState(null);
+  const [article, setArticle]           = useState(null);
+  const [precs, setPrecs]               = useState([]);
+  const [activeTab, setActiveTab]       = useState('article');
+  const [isArticleLoading, setIsArticleLoading] = useState(false);
+  const [isPrecsLoading, setIsPrecsLoading]     = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen]     = useState(false);
+  const [hasSearched, setHasSearched]           = useState(false);
+
+  const inputRef    = useRef(null);
+  const settingsRef = useRef(null);
+  const abortRef    = useRef(null);
+
+  async function callApi(userMessage) {
+    if (!anthropicKey.trim()) throw { type: 'MISSING_ANTHROPIC_KEY', message: 'Anthropic API 키를 먼저 입력해주세요.' };
+    if (!ocKey.trim())        throw { type: 'MISSING_OC_KEY',        message: '법제처 OC 인증키를 먼저 입력해주세요. API 설정을 확인하세요.' };
+    if (abortRef.current) abortRef.current.abort();
+    abortRef.current = new AbortController();
+    const tid = setTimeout(() => abortRef.current?.abort(), TIMEOUT);
+    try {
+      const res = await fetch(API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': anthropicKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-beta': 'mcp-client-2025-04-04',
+        },
+        body: JSON.stringify({
+          model: MODEL,
+          max_tokens: 4096,
+          system: SYSTEM_PROMPT,
+          messages: [{ role: 'user', content: userMessage }],
+          mcp_servers: [{
+            type: 'url',
+            url: MCP_URL,
+            name: 'korean-law-mcp',
+            authorization_token: ocKey,
+          }],
+        }),
+        signal: abortRef.current.signal,
+      });
+      clearTimeout(tid);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        if (res.status === 401) throw { type: 'AUTH_ERROR',  code: 401, message: 'Anthropic API 키가 유효하지 않습니다.' };
+        if (res.status === 429) throw { type: 'RATE_LIMIT',  code: 429, message: 'API 요청 한도 초과. 잠시 후 다시 시도하세요.' };
+        throw { type: 'API_ERROR', code: res.status, message: body.error?.message || `API 오류 (${res.status})` };
+      }
+      return await res.json();
+    } catch (e) {
+      clearTimeout(tid);
+      if (e.name === 'AbortError') throw { type: 'TIMEOUT', message: '요청 시간이 초과되었습니다 (30초). 다시 시도해주세요.' };
+      if (e.type) throw e;
+      throw { type: 'NETWORK_ERROR', message: `네트워크 오류: ${e.message}` };
+    }
+  }
+
+  async function handleSearch(q) {
+    const term = q || query;
+    if (!term.trim()) { inputRef.current?.focus(); return; }
+    if (!anthropicKey || !ocKey) {
+      setIsSettingsOpen(true);
+      setError({ type: 'MISSING_OC_KEY', message: '검색하려면 API 키를 먼저 입력하세요. 아래 API 설정을 확인해주세요.' });
+      setTimeout(() => {
+        settingsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        settingsRef.current?.querySelector('input')?.focus();
+      }, 150);
+      return;
+    }
+    setIsLoading(true); setError(null); setHasSearched(true);
+    setSelectedId(null); setArticle(null); setPrecs([]);
+    try {
+      const data = await callApi(
+        `search_law 도구를 사용하여 "${term}"을 검색하세요.\n` +
+        `JSON 배열로 반환: [{law_id, law_name, article_no, summary, precedent_count}]`
+      );
+      setResults(normalizeSearchResults(parseMcpToolResults(data)));
+    } catch (e) {
+      setError(e); setResults([]);
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  async function handleSelect(result) {
+    setSelectedId(result.id); setActiveTab('article');
+    setPrecs([]); setIsArticleLoading(true); setArticle(null);
+    try {
+      const data = await callApi(
+        `get_law_text 도구로 법령ID "${result.id}" 조문 "${result.articleNo || '전체'}" 조회.\n` +
+        `JSON: {law_id, law_name, article_no, article_title, content}`
+      );
+      setArticle(normalizeArticle(parseMcpToolResults(data), result));
+    } catch {
+      setArticle(normalizeArticle(null, result));
+    } finally {
+      setIsArticleLoading(false);
+    }
+  }
+
+  async function handleTabChange(tab) {
+    setActiveTab(tab);
+    if (tab !== 'precedents' || !selectedId || precs.length || isPrecsLoading) return;
+    const sel = results.find(r => r.id === selectedId);
+    setIsPrecsLoading(true);
+    try {
+      const data = await callApi(
+        `search_precedents 도구로 법령ID "${selectedId}" (${sel?.lawName || ''}) 관련 판례 검색.\n` +
+        `JSON: {precedents: [{case_id, court, date, case_no, summary, content}]}`
+      );
+      setPrecs(normalizePrecedents(parseMcpToolResults(data)));
+    } catch {
+      setPrecs([]);
+    } finally {
+      setIsPrecsLoading(false);
+    }
+  }
+
+  function handleQuickSearch(q) { setQuery(q); handleSearch(q); }
+  function handleKeyChange(key, val) { if (key === 'anthropicKey') setAnthropicKey(val); else setOcKey(val); }
+  function goToSettings() {
+    setIsSettingsOpen(true);
+    setTimeout(() => {
+      settingsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      settingsRef.current?.querySelector('input')?.focus();
+    }, 150);
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col">
+      <header className="bg-blue-900 text-white">
+        <div className="max-w-5xl mx-auto px-4 py-4 flex items-center justify-between">
+          <div>
+            <h1 className="text-lg font-bold tracking-tight">법률 정보 검색</h1>
+            <p className="text-blue-300 text-xs mt-0.5">법령 및 관련 판례 통합 검색</p>
+          </div>
+          <div className="hidden sm:block text-right">
+            <p className="text-blue-300 text-xs">korean-law-mcp</p>
+            <p className="text-blue-400 text-xs">Powered by Claude</p>
+          </div>
+        </div>
+      </header>
+
+      <SettingsPanel anthropicKey={anthropicKey} ocKey={ocKey} onChange={handleKeyChange}
+        isOpen={isSettingsOpen} onToggle={() => setIsSettingsOpen(v => !v)} panelRef={settingsRef} />
+
+      <main className="max-w-5xl mx-auto w-full px-4 py-5 flex-1">
+        <SearchBar query={query} onChange={setQuery} onSearch={() => handleSearch()}
+          isLoading={isLoading} onQuickSearch={handleQuickSearch} inputRef={inputRef} />
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
+            <h2 className="text-sm font-bold text-gray-700 mb-3 flex items-center gap-1.5">
+              <svg className="w-4 h-4 text-indigo-700" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                  d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+              </svg>
+              검색 결과
+            </h2>
+            <SearchResults results={results} selectedId={selectedId} onSelect={handleSelect}
+              isLoading={isLoading} error={error} hasSearched={hasSearched} query={query}
+              onRetry={() => handleSearch()} onQuickSearch={handleQuickSearch} onGoSettings={goToSettings} />
+          </div>
+          <DetailPanel article={article} precs={precs} activeTab={activeTab}
+            onTabChange={handleTabChange} isArticleLoading={isArticleLoading} isPrecsLoading={isPrecsLoading} />
+        </div>
+      </main>
+
+      <footer className="border-t border-gray-200 bg-white mt-4">
+        <div className="max-w-5xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs text-gray-400">
+          <span>법령 데이터: 법제처 국가법령정보센터</span>
+          <div className="flex gap-3">
+            <a href="https://open.law.go.kr" target="_blank" rel="noopener noreferrer" className="hover:text-indigo-600">OC 인증키 발급</a>
+            <a href="https://console.anthropic.com" target="_blank" rel="noopener noreferrer" className="hover:text-indigo-600">Anthropic API 키</a>
+          </div>
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
