@@ -21,6 +21,28 @@
   <script type="text/babel">
 const { useState, useRef } = React;
 
+// ── 법제처 API 직접 호출 ──────────────────────────────────────
+const OC   = 'kangaco';
+const BASE = 'https://www.law.go.kr/DRF';
+
+async function lawSearch(query, target = 'law') {
+  const url = `${BASE}/lawSearch.do?OC=${OC}&target=${target}&type=JSON&query=${encodeURIComponent(query)}&display=20&page=1`;
+  console.log('[법제처 요청]', url);
+  const res  = await fetch(url);
+  const data = await res.json();
+  console.log('[법제처 응답]', data);
+  return data;
+}
+
+async function lawDetail(id, target = 'law') {
+  const url = `${BASE}/lawService.do?OC=${OC}&target=${target}&ID=${id}&type=JSON`;
+  console.log('[법제처 상세 요청]', url);
+  const res  = await fetch(url);
+  const data = await res.json();
+  console.log('[법제처 상세 응답]', data);
+  return data;
+}
+
 const QUICK_SEARCHES = ['임대차보호법', '근로기준법', '형법', '민법', '상법'];
 
 // ── 유틸리티 ─────────────────────────────────────────────────
@@ -30,25 +52,9 @@ function fmt(d) {
 }
 function toArr(v) { if (!v) return []; return Array.isArray(v) ? v : [v]; }
 
-// ── 법제처 응답 파싱 ──────────────────────────────────────────
+// ── 파싱 ─────────────────────────────────────────────────────
 function parseLawSearch(data) {
-  console.log('[법제처 법령검색 원본응답]', data);
-
-  // XML이 반환된 경우
-  if (data?._raw) {
-    console.warn('[법제처] JSON이 아닌 응답 수신 (XML?):', data._raw);
-    return [];
-  }
-
-  const s = data?.LawSearch;
-  if (!s) {
-    console.warn('[법제처] LawSearch 키 없음. 응답 키:', Object.keys(data || {}));
-    return [];
-  }
-
-  console.log('[법제처] totalCnt:', s.totalCnt, '/ 법령 필드:', s.법령);
-
-  return toArr(s.법령).map(it => ({
+  return toArr(data?.LawSearch?.법령).map(it => ({
     id:       it.법령ID,
     lawName:  it.법령명한글 || '(법령명 없음)',
     lawType:  it.법령구분  || '',
@@ -71,7 +77,6 @@ function buildContent(a) {
 }
 
 function parseLawContent(data) {
-  console.log('[법제처 법령내용 원본응답]', data);
   const basic = data?.법령?.기본정보 || {};
   return {
     lawName:  basic.법령명_한글 || basic.법령명한글 || '',
@@ -84,8 +89,6 @@ function parseLawContent(data) {
 }
 
 function parsePrecSearch(data) {
-  console.log('[법제처 판례검색 원본응답]', data);
-  if (data?._raw) return [];
   return toArr(data?.PrecSearch?.판례).map(it => ({
     id:       it.판례정보일련번호,
     court:    it.법원명   || '법원',
@@ -115,7 +118,7 @@ function Empty({ query, onQuickSearch }) {
       </svg>
       {query
         ? <><p className="text-gray-700 font-medium text-sm mb-1">"{query}"에 대한 결과가 없습니다.</p>
-            <p className="text-gray-400 text-xs mb-5">브라우저 콘솔(F12)에서 응답을 확인해보세요.</p></>
+            <p className="text-gray-400 text-xs mb-5">다른 검색어를 입력해보세요.</p></>
         : <p className="text-gray-400 text-sm mb-5">검색어를 입력하여 법령을 검색하세요.</p>
       }
       <div className="flex flex-wrap gap-2 justify-center">
@@ -349,12 +352,13 @@ function App() {
     setIsSearching(true); setSearchErr(null); setHasSearched(true);
     setLaws([]); setSelectedLaw(null); setLawContent(null); setPrecs([]);
     try {
-      const res  = await fetch(`/api/search?q=${encodeURIComponent(term)}&target=law`);
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      const data = await lawSearch(term, 'law');
       setLaws(parseLawSearch(data));
     } catch (e) {
-      setSearchErr(e.message || '검색 중 오류가 발생했습니다.');
+      console.error('[검색 오류]', e);
+      setSearchErr(e.message?.includes('Failed to fetch')
+        ? 'CORS 오류: 법제처 API에 직접 접근이 차단되었습니다.'
+        : (e.message || '검색 중 오류가 발생했습니다.'));
     } finally {
       setIsSearching(false);
     }
@@ -364,8 +368,7 @@ function App() {
     setSelectedLaw(law); setActiveTab('law');
     setLawContent(null); setPrecs([]); setIsLawLoading(true);
     try {
-      const res  = await fetch(`/api/law?id=${law.id}&target=law`);
-      const data = await res.json();
+      const data = await lawDetail(law.id, 'law');
       setLawContent(parseLawContent(data));
     } catch {
       setLawContent({ lawName: law.lawName, articles: [] });
@@ -379,8 +382,7 @@ function App() {
     if (tab !== 'prec' || !selectedLaw || precs.length || isPrecLoading) return;
     setIsPrecLoading(true);
     try {
-      const res  = await fetch(`/api/search?q=${encodeURIComponent(selectedLaw.lawName)}&target=prec`);
-      const data = await res.json();
+      const data = await lawSearch(selectedLaw.lawName, 'prec');
       setPrecs(parsePrecSearch(data));
     } catch {
       setPrecs([]);
@@ -415,9 +417,9 @@ function App() {
               </svg>
               검색 결과
             </h2>
-            {isSearching   ? <Spinner text="법령을 검색하고 있습니다..." /> :
-             searchErr     ? <ErrMsg msg={searchErr} onRetry={() => handleSearch()} /> :
-             !hasSearched  ? <Empty query="" onQuickSearch={handleQuickSearch} /> :
+            {isSearching      ? <Spinner text="법령을 검색하고 있습니다..." /> :
+             searchErr        ? <ErrMsg msg={searchErr} onRetry={() => handleSearch()} /> :
+             !hasSearched     ? <Empty query="" onQuickSearch={handleQuickSearch} /> :
              laws.length === 0 ? <Empty query={query} onQuickSearch={handleQuickSearch} /> :
              <div className="space-y-2">
                <p className="text-xs text-gray-400">총 <strong className="text-gray-600">{laws.length}건</strong></p>
