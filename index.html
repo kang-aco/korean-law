@@ -19,19 +19,11 @@
 <body class="bg-gray-50">
   <div id="root"></div>
   <script type="text/babel">
-/**
- * 법률 정보 검색 웹 앱
- * 팀: UI 조교 → API 조교 → UX 조교 (Agentic Workflow)
- * 사용 MCP: korean-law-mcp (https://korean-law-mcp.fly.dev/mcp)
- * 필요: Anthropic API 키 + 법제처 OC 인증키 (https://open.law.go.kr 에서 발급)
- * 주의: 프로덕션 환경에서는 백엔드 프록시를 통해 API를 호출하세요 (보안/CORS)
- */
-
 const { useState, useRef } = React;
 
 // ── 상수 ─────────────────────────────────────────────────────
-const API_URL  = 'https://api.anthropic.com/v1/messages';
-const MCP_URL  = 'https://korean-law-mcp.fly.dev/mcp';
+const API_URL  = '/api/chat';
+const MCP_URL  = 'https://korean-law-mcp.fly.dev/mcp?oc=kangaco';
 const MODEL    = 'claude-sonnet-4-20250514';
 const TIMEOUT  = 30_000;
 const QUICK_SEARCHES = ['임대차보호법', '근로기준법', '형법', '민법', '상법'];
@@ -136,7 +128,7 @@ function EmptyState({ query, onQuickSearch }) {
 }
 
 // ── 에러 메시지 ───────────────────────────────────────────────
-function ErrorMessage({ error, onRetry, onGoSettings }) {
+function ErrorMessage({ error, onRetry }) {
   return (
     <div className="m-2 p-4 bg-red-50 border border-red-200 rounded-lg" role="alert">
       <div className="flex items-start gap-3">
@@ -156,71 +148,6 @@ function ErrorMessage({ error, onRetry, onGoSettings }) {
           다시 시도
         </button>
       )}
-      {(error?.type === 'MISSING_OC_KEY' || error?.type === 'MISSING_ANTHROPIC_KEY') && onGoSettings && (
-        <button onClick={onGoSettings}
-          className="mt-3 w-full min-h-[40px] bg-amber-100 hover:bg-amber-200 text-amber-700 rounded-md text-sm font-medium transition-colors">
-          API 설정 열기 →
-        </button>
-      )}
-    </div>
-  );
-}
-
-// ── 설정 패널 ─────────────────────────────────────────────────
-function SettingsPanel({ anthropicKey, ocKey, onChange, isOpen, onToggle, panelRef }) {
-  const hasKeys = anthropicKey && ocKey;
-  return (
-    <div className="bg-white border-b border-gray-200 shadow-sm" ref={panelRef}>
-      <div className="max-w-5xl mx-auto px-4">
-        <button onClick={onToggle} aria-expanded={isOpen}
-          className="w-full flex items-center justify-between py-3 text-sm text-gray-600 hover:text-indigo-700 transition-colors">
-          <div className="flex items-center gap-2">
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-            </svg>
-            <span className="font-medium">API 설정</span>
-            {!hasKeys
-              ? <span className="px-2 py-0.5 bg-amber-100 text-amber-700 text-xs rounded-full">인증키 필요</span>
-              : <span className="px-2 py-0.5 bg-green-100 text-green-700 text-xs rounded-full">연결됨</span>
-            }
-          </div>
-          <svg className={`w-4 h-4 transition-transform ${isOpen ? 'rotate-180' : ''}`}
-            fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-          </svg>
-        </button>
-        {isOpen && (
-          <div className="pb-4 space-y-3">
-            <div>
-              <label className="block text-xs font-semibold text-gray-700 mb-1">
-                Anthropic API 키
-                <span className="ml-1 font-normal text-gray-400">(console.anthropic.com에서 발급)</span>
-              </label>
-              <input type="password" value={anthropicKey} onChange={e => onChange('anthropicKey', e.target.value)}
-                placeholder="sk-ant-api03-..."
-                className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono" />
-            </div>
-            <div>
-              <label className="block text-xs font-semibold text-gray-700 mb-1">
-                법제처 OC 인증키
-                <a href="https://open.law.go.kr" target="_blank" rel="noopener noreferrer"
-                  className="ml-1 font-normal text-indigo-600 hover:underline">(open.law.go.kr에서 무료 발급 →)</a>
-              </label>
-              <input type="password" value={ocKey} onChange={e => onChange('ocKey', e.target.value)}
-                placeholder="법제처 OC 인증키 입력"
-                className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-              <p className="text-xs text-gray-400 mt-1">
-                open.law.go.kr 접속 → 로그인 → 마이페이지 → 오픈API 신청 → OC키 발급
-              </p>
-            </div>
-            <p className="text-xs text-gray-400 bg-gray-50 rounded p-2">
-              🔒 입력한 키는 브라우저 메모리에만 저장되며 외부 서버로 전송되지 않습니다.
-            </p>
-          </div>
-        )}
-      </div>
     </div>
   );
 }
@@ -299,9 +226,9 @@ function ResultCard({ result, isSelected, onClick }) {
 }
 
 // ── 검색 결과 목록 ────────────────────────────────────────────
-function SearchResults({ results, selectedId, onSelect, isLoading, error, hasSearched, query, onRetry, onQuickSearch, onGoSettings }) {
+function SearchResults({ results, selectedId, onSelect, isLoading, error, hasSearched, query, onRetry, onQuickSearch }) {
   if (isLoading) return <LoadingSpinner text="법령을 검색하고 있습니다..." />;
-  if (error) return <ErrorMessage error={error} onRetry={onRetry} onGoSettings={onGoSettings} />;
+  if (error) return <ErrorMessage error={error} onRetry={onRetry} />;
   if (!hasSearched) return <EmptyState query="" onQuickSearch={onQuickSearch} />;
   if (results.length === 0) return <EmptyState query={query} onQuickSearch={onQuickSearch} />;
   return (
@@ -427,8 +354,6 @@ function DetailPanel({ article, precs, activeTab, onTabChange, isArticleLoading,
 
 // ── 메인 앱 ──────────────────────────────────────────────────
 function App() {
-  const [anthropicKey, setAnthropicKey] = useState('');
-  const [ocKey, setOcKey]               = useState('');
   const [query, setQuery]               = useState('');
   const [isLoading, setIsLoading]       = useState(false);
   const [error, setError]               = useState(null);
@@ -439,28 +364,19 @@ function App() {
   const [activeTab, setActiveTab]       = useState('article');
   const [isArticleLoading, setIsArticleLoading] = useState(false);
   const [isPrecsLoading, setIsPrecsLoading]     = useState(false);
-  const [isSettingsOpen, setIsSettingsOpen]     = useState(false);
   const [hasSearched, setHasSearched]           = useState(false);
 
-  const inputRef    = useRef(null);
-  const settingsRef = useRef(null);
-  const abortRef    = useRef(null);
+  const inputRef = useRef(null);
+  const abortRef = useRef(null);
 
   async function callApi(userMessage) {
-    if (!anthropicKey.trim()) throw { type: 'MISSING_ANTHROPIC_KEY', message: 'Anthropic API 키를 먼저 입력해주세요.' };
-    if (!ocKey.trim())        throw { type: 'MISSING_OC_KEY',        message: '법제처 OC 인증키를 먼저 입력해주세요. API 설정을 확인하세요.' };
     if (abortRef.current) abortRef.current.abort();
     abortRef.current = new AbortController();
     const tid = setTimeout(() => abortRef.current?.abort(), TIMEOUT);
     try {
       const res = await fetch(API_URL, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': anthropicKey,
-          'anthropic-version': '2023-06-01',
-          'anthropic-beta': 'mcp-client-2025-04-04',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: MODEL,
           max_tokens: 4096,
@@ -470,7 +386,6 @@ function App() {
             type: 'url',
             url: MCP_URL,
             name: 'korean-law-mcp',
-            authorization_token: ocKey,
           }],
         }),
         signal: abortRef.current.signal,
@@ -478,7 +393,7 @@ function App() {
       clearTimeout(tid);
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
-        if (res.status === 401) throw { type: 'AUTH_ERROR',  code: 401, message: 'Anthropic API 키가 유효하지 않습니다.' };
+        if (res.status === 401) throw { type: 'AUTH_ERROR',  code: 401, message: '서버 API 키가 유효하지 않습니다.' };
         if (res.status === 429) throw { type: 'RATE_LIMIT',  code: 429, message: 'API 요청 한도 초과. 잠시 후 다시 시도하세요.' };
         throw { type: 'API_ERROR', code: res.status, message: body.error?.message || `API 오류 (${res.status})` };
       }
@@ -494,15 +409,6 @@ function App() {
   async function handleSearch(q) {
     const term = q || query;
     if (!term.trim()) { inputRef.current?.focus(); return; }
-    if (!anthropicKey || !ocKey) {
-      setIsSettingsOpen(true);
-      setError({ type: 'MISSING_OC_KEY', message: '검색하려면 API 키를 먼저 입력하세요. 아래 API 설정을 확인해주세요.' });
-      setTimeout(() => {
-        settingsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        settingsRef.current?.querySelector('input')?.focus();
-      }, 150);
-      return;
-    }
     setIsLoading(true); setError(null); setHasSearched(true);
     setSelectedId(null); setArticle(null); setPrecs([]);
     try {
@@ -553,14 +459,6 @@ function App() {
   }
 
   function handleQuickSearch(q) { setQuery(q); handleSearch(q); }
-  function handleKeyChange(key, val) { if (key === 'anthropicKey') setAnthropicKey(val); else setOcKey(val); }
-  function goToSettings() {
-    setIsSettingsOpen(true);
-    setTimeout(() => {
-      settingsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      settingsRef.current?.querySelector('input')?.focus();
-    }, 150);
-  }
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col">
@@ -577,9 +475,6 @@ function App() {
         </div>
       </header>
 
-      <SettingsPanel anthropicKey={anthropicKey} ocKey={ocKey} onChange={handleKeyChange}
-        isOpen={isSettingsOpen} onToggle={() => setIsSettingsOpen(v => !v)} panelRef={settingsRef} />
-
       <main className="max-w-5xl mx-auto w-full px-4 py-5 flex-1">
         <SearchBar query={query} onChange={setQuery} onSearch={() => handleSearch()}
           isLoading={isLoading} onQuickSearch={handleQuickSearch} inputRef={inputRef} />
@@ -594,7 +489,7 @@ function App() {
             </h2>
             <SearchResults results={results} selectedId={selectedId} onSelect={handleSelect}
               isLoading={isLoading} error={error} hasSearched={hasSearched} query={query}
-              onRetry={() => handleSearch()} onQuickSearch={handleQuickSearch} onGoSettings={goToSettings} />
+              onRetry={() => handleSearch()} onQuickSearch={handleQuickSearch} />
           </div>
           <DetailPanel article={article} precs={precs} activeTab={activeTab}
             onTabChange={handleTabChange} isArticleLoading={isArticleLoading} isPrecsLoading={isPrecsLoading} />
@@ -602,12 +497,8 @@ function App() {
       </main>
 
       <footer className="border-t border-gray-200 bg-white mt-4">
-        <div className="max-w-5xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs text-gray-400">
-          <span>법령 데이터: 법제처 국가법령정보센터</span>
-          <div className="flex gap-3">
-            <a href="https://open.law.go.kr" target="_blank" rel="noopener noreferrer" className="hover:text-indigo-600">OC 인증키 발급</a>
-            <a href="https://console.anthropic.com" target="_blank" rel="noopener noreferrer" className="hover:text-indigo-600">Anthropic API 키</a>
-          </div>
+        <div className="max-w-5xl mx-auto px-4 py-3 text-xs text-gray-400">
+          <span>법령 데이터: 법제처 국가법령정보센터 · Powered by Claude AI</span>
         </div>
       </footer>
     </div>
