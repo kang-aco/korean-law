@@ -21,98 +21,82 @@
   <script type="text/babel">
 const { useState, useRef } = React;
 
-// ── 상수 ─────────────────────────────────────────────────────
-const API_URL  = '/api/chat';
-const MCP_URL  = 'https://korean-law-mcp.fly.dev/mcp?oc=kangaco';
-const MODEL    = 'claude-sonnet-4-20250514';
-const TIMEOUT  = 30_000;
 const QUICK_SEARCHES = ['임대차보호법', '근로기준법', '형법', '민법', '상법'];
-const SYSTEM_PROMPT =
-  '당신은 대한민국 법령 검색 전문가입니다. 제공된 MCP 도구를 사용하여 사용자 요청에 응답하세요. ' +
-  '결과는 설명 텍스트 없이 JSON만 반환하세요.';
 
-// ── 파싱 유틸리티 ─────────────────────────────────────────────
-function extractJson(text) {
-  try { const m = text.match(/```(?:json)?\s*([\s\S]+?)\s*```/); return JSON.parse(m ? m[1] : text); }
-  catch { return null; }
+// ── 유틸리티 ─────────────────────────────────────────────────
+function fmt(d) {
+  if (!d || d.length < 8) return d || '';
+  return `${d.slice(0,4)}.${d.slice(4,6)}.${d.slice(6,8)}`;
 }
+function toArr(v) { if (!v) return []; return Array.isArray(v) ? v : [v]; }
 
-function parseMcpToolResults(data) {
-  if (!data?.content) return null;
-  for (const b of data.content) {
-    if (b.type === 'mcp_tool_result' || b.type === 'tool_result') {
-      const items = Array.isArray(b.content) ? b.content : [{ type: 'text', text: b.output || '' }];
-      for (const item of items) {
-        if (item.type === 'text') { const p = extractJson(item.text); if (p) return p; }
-      }
-    }
-  }
-  for (const b of data.content) {
-    if (b.type === 'text') { const p = extractJson(b.text); return p || { rawText: b.text }; }
-  }
-  return null;
-}
-
-function normalizeSearchResults(raw) {
-  if (!raw) return [];
-  const items = Array.isArray(raw) ? raw : raw.results || raw.laws || raw.items || [];
-  return items.map((it, i) => ({
-    id:             it.law_id   || it.lawId   || `r-${i}`,
-    lawName:        it.law_name || it.lawName || it.name || '(법령명 없음)',
-    articleNo:      it.article_no || it.articleNo || it.article || '',
-    summary:        it.summary || it.description || it.content || '',
-    precedentCount: it.precedent_count || it.precedentCount || 0,
-    raw: it,
+// ── 법제처 응답 파싱 ──────────────────────────────────────────
+function parseLawSearch(data) {
+  return toArr(data?.LawSearch?.법령).map(it => ({
+    id:       it.법령ID,
+    lawName:  it.법령명한글 || '(법령명 없음)',
+    lawType:  it.법령구분  || '',
+    ministry: it.소관부처명 || '',
+    date:     fmt(it.시행일자),
   }));
 }
 
-function normalizeArticle(raw, fb) {
-  if (!raw) return fb
-    ? { lawName: fb.lawName, articleNo: fb.articleNo, articleTitle: '', text: fb.summary || '조문 원문을 불러올 수 없습니다.' }
-    : null;
-  if (raw.rawText) return { lawName: fb?.lawName || '법령', articleNo: fb?.articleNo || '', articleTitle: '', text: raw.rawText };
+function buildContent(a) {
+  const 항list = toArr(a.항);
+  if (항list.length) {
+    return 항list.map(h => {
+      let t = h.항내용 || '';
+      const 호list = toArr(h.호);
+      if (호list.length) t += '\n' + 호list.map(g => `  ${g.호번호 || ''}. ${g.호내용 || ''}`).join('\n');
+      return t;
+    }).filter(Boolean).join('\n');
+  }
+  return a.조문내용 || '';
+}
+
+function parseLawContent(data) {
+  const basic = data?.법령?.기본정보 || {};
   return {
-    lawName:      raw.law_name  || raw.lawName  || fb?.lawName  || '법령',
-    articleNo:    raw.article_no || raw.articleNo || fb?.articleNo || '',
-    articleTitle: raw.article_title || raw.articleTitle || raw.title || '',
-    text:         raw.content   || raw.text     || raw.article_text || '조문 내용 없음',
+    lawName:  basic.법령명_한글 || basic.법령명한글 || '',
+    articles: toArr(data?.법령?.조문?.조문단위).map(a => ({
+      no:      a.조문번호 ? `제${a.조문번호}조` : '',
+      title:   a.조문제목 || '',
+      content: buildContent(a),
+    })),
   };
 }
 
-function normalizePrecedents(raw) {
-  if (!raw) return [];
-  const items = Array.isArray(raw) ? raw : raw.precedents || raw.cases || raw.results || [];
-  return items.map((it, i) => ({
-    id:      it.case_id  || `p-${i}`,
-    court:   it.court    || '법원',
-    date:    it.date     || it.decision_date || '',
-    caseNo:  it.case_no  || it.caseNo || '',
-    summary: it.summary  || it.title  || '',
-    content: it.content  || it.full_text || '',
+function parsePrecSearch(data) {
+  return toArr(data?.PrecSearch?.판례).map(it => ({
+    id:       it.판례정보일련번호,
+    court:    it.법원명   || '법원',
+    caseNo:   it.사건번호 || '',
+    date:     fmt(it.선고일자),
+    caseName: it.사건명  || '',
+    summary:  it.판결요지 || it.판시사항 || '',
   }));
 }
 
-// ── 로딩 스피너 ───────────────────────────────────────────────
-function LoadingSpinner({ text = '불러오는 중...' }) {
+// ── 공통 UI ───────────────────────────────────────────────────
+function Spinner({ text }) {
   return (
-    <div className="flex flex-col items-center justify-center py-12" role="status" aria-label={text}>
+    <div className="flex flex-col items-center justify-center py-12">
       <div className="w-9 h-9 border-4 border-indigo-100 border-t-indigo-700 rounded-full animate-spin" />
       <p className="mt-3 text-indigo-700 text-sm font-medium">{text}</p>
     </div>
   );
 }
 
-// ── 빈 결과 안내 ──────────────────────────────────────────────
-function EmptyState({ query, onQuickSearch }) {
+function Empty({ query, onQuickSearch }) {
   return (
     <div className="flex flex-col items-center justify-center py-12 text-center px-4">
-      <svg className="w-14 h-14 text-gray-200 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+      <svg className="w-14 h-14 text-gray-200 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
           d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
       </svg>
       {query
-        ? <><p className="text-gray-700 font-medium text-sm mb-1">"{query}"에 대한 검색 결과가 없습니다.</p>
-            <p className="text-gray-400 text-xs mb-5">검색어를 바꾸거나 아래 예시를 선택해보세요.</p></>
+        ? <><p className="text-gray-700 font-medium text-sm mb-1">"{query}"에 대한 결과가 없습니다.</p>
+            <p className="text-gray-400 text-xs mb-5">다른 검색어를 입력해보세요.</p></>
         : <p className="text-gray-400 text-sm mb-5">검색어를 입력하여 법령을 검색하세요.</p>
       }
       <div className="flex flex-wrap gap-2 justify-center">
@@ -127,24 +111,17 @@ function EmptyState({ query, onQuickSearch }) {
   );
 }
 
-// ── 에러 메시지 ───────────────────────────────────────────────
-function ErrorMessage({ error, onRetry }) {
+function ErrMsg({ msg, onRetry }) {
   return (
-    <div className="m-2 p-4 bg-red-50 border border-red-200 rounded-lg" role="alert">
+    <div className="m-2 p-4 bg-red-50 border border-red-200 rounded-lg">
       <div className="flex items-start gap-3">
-        <svg className="w-5 h-5 text-red-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-            d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+        <svg className="w-5 h-5 text-red-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
         </svg>
-        <div>
-          <p className="text-red-700 font-semibold text-sm">오류 발생</p>
-          <p className="text-red-600 text-sm mt-1">{error?.message || '알 수 없는 오류'}</p>
-          {error?.code && <p className="text-red-400 text-xs mt-1">코드: {error.code}</p>}
-        </div>
+        <p className="text-red-600 text-sm">{msg}</p>
       </div>
-      {error?.type === 'TIMEOUT' && onRetry && (
-        <button onClick={onRetry}
-          className="mt-3 w-full min-h-[40px] bg-red-100 hover:bg-red-200 text-red-700 rounded-md text-sm font-medium transition-colors">
+      {onRetry && (
+        <button onClick={onRetry} className="mt-3 w-full min-h-[40px] bg-red-100 hover:bg-red-200 text-red-700 rounded-md text-sm font-medium">
           다시 시도
         </button>
       )}
@@ -159,20 +136,19 @@ function SearchBar({ query, onChange, onSearch, isLoading, onQuickSearch, inputR
       <div className="flex gap-2">
         <div className="relative flex-1">
           <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none"
-            fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
           </svg>
           <input ref={inputRef} type="search" value={query} onChange={e => onChange(e.target.value)}
             onKeyDown={e => e.key === 'Enter' && !isLoading && onSearch()}
-            placeholder="예: 근로기준법, 형법 제250조, 주택임대차보호법"
-            aria-label="법령 검색어 입력"
+            placeholder="예: 근로기준법, 형법, 주택임대차보호법"
             className="w-full pl-10 pr-4 py-2.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" />
         </div>
-        <button onClick={onSearch} disabled={isLoading || !query.trim()} aria-label="검색"
-          className="px-5 py-2.5 min-h-[44px] bg-indigo-700 hover:bg-indigo-800 active:bg-indigo-900 disabled:bg-gray-300 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-lg transition-colors whitespace-nowrap">
+        <button onClick={onSearch} disabled={isLoading || !query.trim()}
+          className="px-5 py-2.5 min-h-[44px] bg-indigo-700 hover:bg-indigo-800 disabled:bg-gray-300 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-lg transition-colors whitespace-nowrap">
           {isLoading
             ? <span className="flex items-center gap-2">
-                <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24" aria-hidden="true">
+                <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
                   <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
                   <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
                 </svg>검색 중
@@ -194,93 +170,83 @@ function SearchBar({ query, onChange, onSearch, isLoading, onQuickSearch, inputR
   );
 }
 
-// ── 결과 카드 ─────────────────────────────────────────────────
-function ResultCard({ result, isSelected, onClick }) {
+// ── 법령 카드 ─────────────────────────────────────────────────
+function LawCard({ law, isSelected, onClick }) {
   return (
     <div role="button" tabIndex={0} onClick={onClick}
       onKeyDown={e => (e.key === 'Enter' || e.key === ' ') && onClick()}
-      aria-pressed={isSelected}
       className={`p-4 rounded-lg border cursor-pointer transition-all focus:outline-none focus:ring-2 focus:ring-indigo-400 ${
         isSelected ? 'border-indigo-500 bg-indigo-50' : 'border-gray-200 bg-white hover:border-indigo-300 hover:shadow-sm'
       }`}>
-      <div className="flex items-start gap-3">
-        <div className="flex-1 min-w-0">
-          <div className="flex flex-wrap items-center gap-1.5 mb-1.5">
-            {result.articleNo && (
-              <span className="text-xs font-bold px-2 py-0.5 bg-indigo-700 text-white rounded flex-shrink-0">
-                {result.articleNo}
-              </span>
-            )}
-            <h3 className="font-bold text-gray-900 text-sm">{result.lawName}</h3>
-          </div>
-          <p className="text-gray-500 text-xs leading-relaxed line-clamp-2">{result.summary}</p>
-        </div>
-        {result.precedentCount > 0 && (
-          <span className="flex-shrink-0 text-xs px-2 py-1 bg-amber-50 text-amber-700 border border-amber-200 rounded-full whitespace-nowrap">
-            판례 {result.precedentCount}건
-          </span>
+      <div className="flex flex-wrap items-center gap-1.5 mb-1">
+        {law.lawType && (
+          <span className="text-xs font-bold px-2 py-0.5 bg-indigo-700 text-white rounded">{law.lawType}</span>
         )}
+        <h3 className="font-bold text-gray-900 text-sm">{law.lawName}</h3>
+      </div>
+      <div className="flex flex-wrap gap-x-3 text-xs text-gray-400">
+        {law.ministry && <span>{law.ministry}</span>}
+        {law.date && <span>시행 {law.date}</span>}
       </div>
     </div>
   );
 }
 
-// ── 검색 결과 목록 ────────────────────────────────────────────
-function SearchResults({ results, selectedId, onSelect, isLoading, error, hasSearched, query, onRetry, onQuickSearch }) {
-  if (isLoading) return <LoadingSpinner text="법령을 검색하고 있습니다..." />;
-  if (error) return <ErrorMessage error={error} onRetry={onRetry} />;
-  if (!hasSearched) return <EmptyState query="" onQuickSearch={onQuickSearch} />;
-  if (results.length === 0) return <EmptyState query={query} onQuickSearch={onQuickSearch} />;
+// ── 조문 뷰 ──────────────────────────────────────────────────
+function ArticlesView({ lawContent, isLoading }) {
+  const [openIdx, setOpenIdx] = useState(null);
+
+  if (isLoading) return <Spinner text="조문을 불러오는 중..." />;
+  if (!lawContent) return (
+    <div className="flex flex-col items-center justify-center py-10 text-center">
+      <svg className="w-12 h-12 text-gray-200 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+          d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+      </svg>
+      <p className="text-gray-400 text-sm">좌측에서 법령을 선택하면<br/>조문을 볼 수 있습니다.</p>
+    </div>
+  );
+
   return (
     <div className="space-y-2">
-      <p className="text-xs text-gray-400">총 <strong className="text-gray-600">{results.length}건</strong>의 검색 결과</p>
-      {results.map(r => (
-        <ResultCard key={r.id} result={r} isSelected={selectedId === r.id} onClick={() => onSelect(r)} />
+      <div className="bg-indigo-50 border-l-4 border-indigo-700 rounded-r-lg px-4 py-3 mb-3">
+        <h3 className="text-indigo-900 font-bold text-base">{lawContent.lawName}</h3>
+        <p className="text-indigo-600 text-xs mt-0.5">총 {lawContent.articles.length}개 조문</p>
+      </div>
+      {lawContent.articles.map((a, i) => (
+        <div key={i} className="border border-gray-200 rounded-lg overflow-hidden">
+          <button onClick={() => setOpenIdx(openIdx === i ? null : i)}
+            className="w-full text-left p-3 bg-white hover:bg-gray-50 transition-colors focus:outline-none">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                {a.no && <span className="text-xs font-bold px-2 py-0.5 bg-indigo-100 text-indigo-700 rounded flex-shrink-0">{a.no}</span>}
+                {a.title && <span className="text-sm text-gray-700 truncate">{a.title}</span>}
+                {!a.title && !a.no && <span className="text-sm text-gray-400">조문</span>}
+              </div>
+              <svg className={`w-4 h-4 text-gray-400 flex-shrink-0 transition-transform ${openIdx === i ? 'rotate-180' : ''}`}
+                fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </div>
+          </button>
+          {openIdx === i && (
+            <div className="px-4 pb-4 pt-2 bg-gray-50 border-t border-gray-200">
+              <p className="text-gray-800 text-sm leading-7 article-text">{a.content || '내용 없음'}</p>
+            </div>
+          )}
+        </div>
       ))}
     </div>
   );
 }
 
-// ── 조문 원문 뷰 ──────────────────────────────────────────────
-function ArticleView({ article, isLoading }) {
-  if (isLoading) return <LoadingSpinner text="조문을 불러오는 중..." />;
-  if (!article) return (
-    <div className="flex flex-col items-center justify-center py-10 text-center">
-      <svg className="w-12 h-12 text-gray-200 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
-          d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
-      </svg>
-      <p className="text-gray-400 text-sm">좌측에서 법령을 선택하면<br/>조문 원문을 볼 수 있습니다.</p>
-    </div>
-  );
-  const paragraphs = (article.text || '').split(/\n{2,}/).filter(p => p.trim());
-  return (
-    <div className="space-y-4">
-      <div className="bg-indigo-50 border-l-4 border-indigo-700 rounded-r-lg p-4">
-        <h3 className="text-indigo-900 font-bold text-base leading-tight">{article.lawName}</h3>
-        {article.articleNo    && <p className="text-indigo-700 font-bold text-sm mt-1">{article.articleNo}</p>}
-        {article.articleTitle && <p className="text-indigo-600 text-sm mt-0.5">({article.articleTitle})</p>}
-      </div>
-      <div>
-        <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-2">조문 원문</p>
-        <div className="bg-gray-50 border border-gray-200 rounded-lg p-4 space-y-3">
-          {paragraphs.length > 1
-            ? paragraphs.map((p, i) => <p key={i} className="text-gray-800 text-sm leading-7 article-text">{p.trim()}</p>)
-            : <p className="text-gray-800 text-sm leading-7 article-text">{article.text}</p>
-          }
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ── 판례 아이템 ───────────────────────────────────────────────
-function PrecedentItem({ prec }) {
+// ── 판례 뷰 ──────────────────────────────────────────────────
+function PrecItem({ prec }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="border border-gray-200 rounded-lg overflow-hidden">
-      <button onClick={() => setOpen(!open)} aria-expanded={open}
-        className="w-full text-left p-4 bg-white hover:bg-gray-50 transition-colors focus:outline-none focus:ring-2 focus:ring-inset focus:ring-indigo-400">
+      <button onClick={() => setOpen(!open)}
+        className="w-full text-left p-4 bg-white hover:bg-gray-50 transition-colors focus:outline-none">
         <div className="flex items-start gap-3">
           <div className="flex-1 min-w-0">
             <div className="flex flex-wrap items-center gap-1.5 mb-1.5">
@@ -288,52 +254,49 @@ function PrecedentItem({ prec }) {
               <span className="text-xs text-gray-400">{prec.date}</span>
               <span className="text-xs text-gray-400 font-mono">{prec.caseNo}</span>
             </div>
-            <p className="text-gray-700 text-sm font-medium line-clamp-2 leading-relaxed">{prec.summary}</p>
+            <p className="text-gray-700 text-sm font-medium line-clamp-2">{prec.caseName}</p>
+            {prec.summary && <p className="text-gray-500 text-xs mt-1 line-clamp-2">{prec.summary}</p>}
           </div>
           <svg className={`w-4 h-4 text-gray-400 flex-shrink-0 mt-1 transition-transform ${open ? 'rotate-180' : ''}`}
-            fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
           </svg>
         </div>
       </button>
-      {open && prec.content && (
+      {open && prec.summary && (
         <div className="px-4 pb-4 pt-2 bg-gray-50 border-t border-gray-200">
-          <p className="text-gray-700 text-sm leading-7 whitespace-pre-wrap">{prec.content}</p>
+          <p className="text-gray-700 text-sm leading-7 whitespace-pre-wrap">{prec.summary}</p>
         </div>
       )}
     </div>
   );
 }
 
-// ── 판례 뷰 ──────────────────────────────────────────────────
-function PrecedentsView({ precs, isLoading }) {
-  if (isLoading) return <LoadingSpinner text="관련 판례를 검색하는 중..." />;
+function PrecsView({ precs, isLoading }) {
+  if (isLoading) return <Spinner text="관련 판례를 검색하는 중..." />;
   if (!precs?.length) return (
-    <div className="py-10 text-center text-gray-400 text-sm">
-      관련 판례가 없거나, 조문을 먼저 선택해주세요.
-    </div>
+    <div className="py-10 text-center text-gray-400 text-sm">관련 판례가 없거나, 법령을 먼저 선택해주세요.</div>
   );
   return (
     <div className="space-y-3">
       <p className="text-xs text-gray-400">관련 판례 <strong className="text-gray-600">{precs.length}건</strong></p>
-      {precs.map((p, i) => <PrecedentItem key={p.id || i} prec={p} />)}
+      {precs.map((p, i) => <PrecItem key={p.id || i} prec={p} />)}
     </div>
   );
 }
 
 // ── 상세 패널 ─────────────────────────────────────────────────
-function DetailPanel({ article, precs, activeTab, onTabChange, isArticleLoading, isPrecsLoading }) {
+function DetailPanel({ lawContent, precs, activeTab, onTabChange, isLawLoading, isPrecLoading }) {
   const tabs = [
-    { key: 'article',    label: '조문 원문' },
-    { key: 'precedents', label: `관련 판례${precs.length ? ` (${precs.length})` : ''}` },
+    { key: 'law',  label: '조문 원문' },
+    { key: 'prec', label: `관련 판례${precs.length ? ` (${precs.length})` : ''}` },
   ];
   return (
     <div className="bg-white rounded-xl shadow-sm border border-gray-200 flex flex-col overflow-hidden">
-      <div className="flex border-b border-gray-200" role="tablist">
+      <div className="flex border-b border-gray-200">
         {tabs.map(t => (
-          <button key={t.key} role="tab" aria-selected={activeTab === t.key}
-            onClick={() => onTabChange(t.key)}
-            className={`flex-1 py-3 min-h-[44px] text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-inset focus:ring-indigo-400 ${
+          <button key={t.key} onClick={() => onTabChange(t.key)}
+            className={`flex-1 py-3 min-h-[44px] text-sm font-medium transition-colors focus:outline-none ${
               activeTab === t.key
                 ? 'text-indigo-700 border-b-2 border-indigo-700 bg-white'
                 : 'text-gray-400 hover:text-gray-600 bg-gray-50'
@@ -342,10 +305,10 @@ function DetailPanel({ article, precs, activeTab, onTabChange, isArticleLoading,
           </button>
         ))}
       </div>
-      <div className="p-4 overflow-y-auto flex-1" style={{ minHeight: '300px', maxHeight: '65vh' }} role="tabpanel">
-        {activeTab === 'article'
-          ? <ArticleView article={article} isLoading={isArticleLoading} />
-          : <PrecedentsView precs={precs} isLoading={isPrecsLoading} />
+      <div className="p-4 overflow-y-auto flex-1" style={{ minHeight: '300px', maxHeight: '65vh' }}>
+        {activeTab === 'law'
+          ? <ArticlesView lawContent={lawContent} isLoading={isLawLoading} />
+          : <PrecsView precs={precs} isLoading={isPrecLoading} />
         }
       </div>
     </div>
@@ -354,107 +317,67 @@ function DetailPanel({ article, precs, activeTab, onTabChange, isArticleLoading,
 
 // ── 메인 앱 ──────────────────────────────────────────────────
 function App() {
-  const [query, setQuery]               = useState('');
-  const [isLoading, setIsLoading]       = useState(false);
-  const [error, setError]               = useState(null);
-  const [results, setResults]           = useState([]);
-  const [selectedId, setSelectedId]     = useState(null);
-  const [article, setArticle]           = useState(null);
-  const [precs, setPrecs]               = useState([]);
-  const [activeTab, setActiveTab]       = useState('article');
-  const [isArticleLoading, setIsArticleLoading] = useState(false);
-  const [isPrecsLoading, setIsPrecsLoading]     = useState(false);
-  const [hasSearched, setHasSearched]           = useState(false);
+  const [query,       setQuery]       = useState('');
+  const [isSearching, setIsSearching] = useState(false);
+  const [searchErr,   setSearchErr]   = useState(null);
+  const [laws,        setLaws]        = useState([]);
+  const [hasSearched, setHasSearched] = useState(false);
+
+  const [selectedLaw,   setSelectedLaw]   = useState(null);
+  const [lawContent,    setLawContent]    = useState(null);
+  const [isLawLoading,  setIsLawLoading]  = useState(false);
+
+  const [precs,         setPrecs]         = useState([]);
+  const [isPrecLoading, setIsPrecLoading] = useState(false);
+  const [activeTab,     setActiveTab]     = useState('law');
 
   const inputRef = useRef(null);
-  const abortRef = useRef(null);
-
-  async function callApi(userMessage) {
-    if (abortRef.current) abortRef.current.abort();
-    abortRef.current = new AbortController();
-    const tid = setTimeout(() => abortRef.current?.abort(), TIMEOUT);
-    try {
-      const res = await fetch(API_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: MODEL,
-          max_tokens: 4096,
-          system: SYSTEM_PROMPT,
-          messages: [{ role: 'user', content: userMessage }],
-          mcp_servers: [{
-            type: 'url',
-            url: MCP_URL,
-            name: 'korean-law-mcp',
-          }],
-        }),
-        signal: abortRef.current.signal,
-      });
-      clearTimeout(tid);
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        if (res.status === 401) throw { type: 'AUTH_ERROR',  code: 401, message: '서버 API 키가 유효하지 않습니다.' };
-        if (res.status === 429) throw { type: 'RATE_LIMIT',  code: 429, message: 'API 요청 한도 초과. 잠시 후 다시 시도하세요.' };
-        throw { type: 'API_ERROR', code: res.status, message: body.error?.message || `API 오류 (${res.status})` };
-      }
-      return await res.json();
-    } catch (e) {
-      clearTimeout(tid);
-      if (e.name === 'AbortError') throw { type: 'TIMEOUT', message: '요청 시간이 초과되었습니다 (30초). 다시 시도해주세요.' };
-      if (e.type) throw e;
-      throw { type: 'NETWORK_ERROR', message: `네트워크 오류: ${e.message}` };
-    }
-  }
 
   async function handleSearch(q) {
-    const term = q || query;
-    if (!term.trim()) { inputRef.current?.focus(); return; }
-    setIsLoading(true); setError(null); setHasSearched(true);
-    setSelectedId(null); setArticle(null); setPrecs([]);
+    const term = (q || query).trim();
+    if (!term) { inputRef.current?.focus(); return; }
+    setIsSearching(true); setSearchErr(null); setHasSearched(true);
+    setLaws([]); setSelectedLaw(null); setLawContent(null); setPrecs([]);
     try {
-      const data = await callApi(
-        `search_law 도구를 사용하여 "${term}"을 검색하세요.\n` +
-        `JSON 배열로 반환: [{law_id, law_name, article_no, summary, precedent_count}]`
-      );
-      setResults(normalizeSearchResults(parseMcpToolResults(data)));
+      const res  = await fetch(`/api/search?q=${encodeURIComponent(term)}&target=law`);
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      const list = parseLawSearch(data);
+      if (!list.length) throw new Error('검색 결과가 없습니다.');
+      setLaws(list);
     } catch (e) {
-      setError(e); setResults([]);
+      setSearchErr(e.message || '검색 중 오류가 발생했습니다.');
     } finally {
-      setIsLoading(false);
+      setIsSearching(false);
     }
   }
 
-  async function handleSelect(result) {
-    setSelectedId(result.id); setActiveTab('article');
-    setPrecs([]); setIsArticleLoading(true); setArticle(null);
+  async function handleSelectLaw(law) {
+    setSelectedLaw(law); setActiveTab('law');
+    setLawContent(null); setPrecs([]); setIsLawLoading(true);
     try {
-      const data = await callApi(
-        `get_law_text 도구로 법령ID "${result.id}" 조문 "${result.articleNo || '전체'}" 조회.\n` +
-        `JSON: {law_id, law_name, article_no, article_title, content}`
-      );
-      setArticle(normalizeArticle(parseMcpToolResults(data), result));
+      const res  = await fetch(`/api/law?id=${law.id}&target=law`);
+      const data = await res.json();
+      setLawContent(parseLawContent(data));
     } catch {
-      setArticle(normalizeArticle(null, result));
+      setLawContent({ lawName: law.lawName, articles: [] });
     } finally {
-      setIsArticleLoading(false);
+      setIsLawLoading(false);
     }
   }
 
   async function handleTabChange(tab) {
     setActiveTab(tab);
-    if (tab !== 'precedents' || !selectedId || precs.length || isPrecsLoading) return;
-    const sel = results.find(r => r.id === selectedId);
-    setIsPrecsLoading(true);
+    if (tab !== 'prec' || !selectedLaw || precs.length || isPrecLoading) return;
+    setIsPrecLoading(true);
     try {
-      const data = await callApi(
-        `search_precedents 도구로 법령ID "${selectedId}" (${sel?.lawName || ''}) 관련 판례 검색.\n` +
-        `JSON: {precedents: [{case_id, court, date, case_no, summary, content}]}`
-      );
-      setPrecs(normalizePrecedents(parseMcpToolResults(data)));
+      const res  = await fetch(`/api/search?q=${encodeURIComponent(selectedLaw.lawName)}&target=prec`);
+      const data = await res.json();
+      setPrecs(parsePrecSearch(data));
     } catch {
       setPrecs([]);
     } finally {
-      setIsPrecsLoading(false);
+      setIsPrecLoading(false);
     }
   }
 
@@ -468,37 +391,46 @@ function App() {
             <h1 className="text-lg font-bold tracking-tight">법률 정보 검색</h1>
             <p className="text-blue-300 text-xs mt-0.5">법령 및 관련 판례 통합 검색</p>
           </div>
-          <div className="hidden sm:block text-right">
-            <p className="text-blue-300 text-xs">korean-law-mcp</p>
-            <p className="text-blue-400 text-xs">Powered by Claude</p>
-          </div>
+          <p className="hidden sm:block text-blue-300 text-xs">법제처 국가법령정보센터</p>
         </div>
       </header>
 
       <main className="max-w-5xl mx-auto w-full px-4 py-5 flex-1">
         <SearchBar query={query} onChange={setQuery} onSearch={() => handleSearch()}
-          isLoading={isLoading} onQuickSearch={handleQuickSearch} inputRef={inputRef} />
+          isLoading={isSearching} onQuickSearch={handleQuickSearch} inputRef={inputRef} />
+
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
             <h2 className="text-sm font-bold text-gray-700 mb-3 flex items-center gap-1.5">
-              <svg className="w-4 h-4 text-indigo-700" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+              <svg className="w-4 h-4 text-indigo-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                   d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
               </svg>
               검색 결과
             </h2>
-            <SearchResults results={results} selectedId={selectedId} onSelect={handleSelect}
-              isLoading={isLoading} error={error} hasSearched={hasSearched} query={query}
-              onRetry={() => handleSearch()} onQuickSearch={handleQuickSearch} />
+            {isSearching   ? <Spinner text="법령을 검색하고 있습니다..." /> :
+             searchErr     ? <ErrMsg msg={searchErr} onRetry={() => handleSearch()} /> :
+             !hasSearched  ? <Empty query="" onQuickSearch={handleQuickSearch} /> :
+             laws.length === 0 ? <Empty query={query} onQuickSearch={handleQuickSearch} /> :
+             <div className="space-y-2">
+               <p className="text-xs text-gray-400">총 <strong className="text-gray-600">{laws.length}건</strong></p>
+               {laws.map(law => (
+                 <LawCard key={law.id} law={law}
+                   isSelected={selectedLaw?.id === law.id}
+                   onClick={() => handleSelectLaw(law)} />
+               ))}
+             </div>
+            }
           </div>
-          <DetailPanel article={article} precs={precs} activeTab={activeTab}
-            onTabChange={handleTabChange} isArticleLoading={isArticleLoading} isPrecsLoading={isPrecsLoading} />
+
+          <DetailPanel lawContent={lawContent} precs={precs} activeTab={activeTab}
+            onTabChange={handleTabChange} isLawLoading={isLawLoading} isPrecLoading={isPrecLoading} />
         </div>
       </main>
 
       <footer className="border-t border-gray-200 bg-white mt-4">
         <div className="max-w-5xl mx-auto px-4 py-3 text-xs text-gray-400">
-          <span>법령 데이터: 법제처 국가법령정보센터 · Powered by Claude AI</span>
+          법령 데이터: 법제처 국가법령정보센터
         </div>
       </footer>
     </div>
