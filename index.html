@@ -14,8 +14,7 @@
     ::-webkit-scrollbar { width: 5px; }
     ::-webkit-scrollbar-track { background: #f8fafc; }
     ::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 4px; }
-    .highlight-article { animation: highlight 1.5s ease-out; }
-    @keyframes highlight { 0%,30% { background:#e0e7ff; } 100% { background:#f9fafb; } }
+    .highlight-article { background: #e0e7ff; }
   </style>
 </head>
 <body class="bg-gray-50">
@@ -28,28 +27,44 @@ const OC   = 'kangaco';
 const BASE = 'https://www.law.go.kr/DRF';
 
 async function apiSearch(query, target = 'law') {
-  const res  = await fetch(`${BASE}/lawSearch.do?OC=${OC}&target=${target}&type=JSON&query=${encodeURIComponent(query)}&display=20&page=1`);
-  return res.json();
+  const res = await fetch(`${BASE}/lawSearch.do?OC=${OC}&target=${target}&type=JSON&query=${encodeURIComponent(query)}&display=20&page=1`);
+  const data = await res.json();
+  console.log(`[법제처 ${target} 검색]`, data);
+  return data;
 }
 async function apiDetail(id, target = 'law') {
-  const res  = await fetch(`${BASE}/lawService.do?OC=${OC}&target=${target}&ID=${id}&type=JSON`);
-  return res.json();
+  const res = await fetch(`${BASE}/lawService.do?OC=${OC}&target=${target}&ID=${id}&type=JSON`);
+  const data = await res.json();
+  console.log(`[법제처 ${target} 상세]`, data);
+  return data;
 }
 
 const QUICK_SEARCHES = ['근로기준법', '민법', '형법', '주택임대차보호법', '상법'];
 
-// ── 검색어에서 조문 번호 추출 ─────────────────────────────────
-// "민법 3조", "근로기준법 제50조", "형법 제250조" 등 처리
+// ── 검색어 파싱: "민법 3조" → { lawName:"민법", articleNo:"3" } ─
 function parseQuery(q) {
   const m = q.trim().match(/^(.+?)\s*제?\s*(\d+)\s*조/);
   if (m) return { lawName: m[1].trim(), articleNo: m[2] };
   return { lawName: q.trim(), articleNo: null };
 }
 
+// ── 검색 결과 관련도 정렬 ─────────────────────────────────────
+function rankResults(list, target) {
+  const t = target.replace(/\s/g, '');
+  return [...list].sort((a, b) => {
+    const na = a.lawName.replace(/\s/g, '');
+    const nb = b.lawName.replace(/\s/g, '');
+    const score = s => s === t ? 0 : s.startsWith(t) ? 1 : s.includes(t) ? 2 : 3;
+    return score(na) - score(nb);
+  });
+}
+
 // ── 유틸리티 ─────────────────────────────────────────────────
 function fmt(d) {
-  if (!d || d.length < 8) return d || '';
-  return `${d.slice(0,4)}.${d.slice(4,6)}.${d.slice(6,8)}`;
+  if (!d) return '';
+  const s = String(d).replace(/\D/g, '');
+  if (s.length < 8) return s;
+  return `${s.slice(0,4)}.${s.slice(4,6)}.${s.slice(6,8)}`;
 }
 function toArr(v) { if (!v) return []; return Array.isArray(v) ? v : [v]; }
 
@@ -57,9 +72,9 @@ function toArr(v) { if (!v) return []; return Array.isArray(v) ? v : [v]; }
 function parseLawSearch(data) {
   const s = data?.LawSearch || {};
   return toArr(s.law || s.법령).map(it => ({
-    id:       it.법령ID    || it.lawId    || '',
-    lawName:  it.법령명한글 || it.lawName  || it.name || '(법령명 없음)',
-    lawType:  it.법령구분  || it.lawType  || '',
+    id:       it.법령ID    || it.lawId || '',
+    lawName:  it.법령명한글 || it.lawName || it.name || '(법령명 없음)',
+    lawType:  it.법령구분  || it.lawType || '',
     ministry: it.소관부처명 || it.ministry || '',
     date:     fmt(it.시행일자 || it.date || ''),
   })).filter(it => it.id);
@@ -71,7 +86,7 @@ function buildContent(a) {
     return 항list.map(h => {
       let t = h.항내용 || h.content || '';
       const 호list = toArr(h.호 || h.subparagraph);
-      if (호list.length) t += '\n' + 호list.map(g => `  ${g.호번호 || g.no || ''}. ${g.호내용 || g.content || ''}`).join('\n');
+      if (호list.length) t += '\n' + 호list.map(g => `  ${g.호번호 || ''}. ${g.호내용 || g.content || ''}`).join('\n');
       return t;
     }).filter(Boolean).join('\n');
   }
@@ -79,14 +94,14 @@ function buildContent(a) {
 }
 
 function parseLawContent(data) {
-  const law   = data?.법령 || data?.law || {};
+  const law  = data?.법령 || data?.law || {};
   const basic = law.기본정보 || law.basicInfo || {};
-  const 조문  = law.조문    || law.article   || {};
+  const 조문 = law.조문 || law.article || {};
   return {
     lawName:  basic.법령명_한글 || basic.법령명한글 || basic.lawName || '',
     articles: toArr(조문.조문단위 || 조문.unit).map(a => ({
-      no:      a.조문번호 ? `제${a.조문번호}조` : (a.articleNo ? `제${a.articleNo}조` : ''),
-      title:   a.조문제목 || a.title   || '',
+      no:      a.조문번호 ? `제${a.조문번호}조` : '',
+      title:   a.조문제목 || a.title || '',
       content: buildContent(a),
     })),
   };
@@ -94,27 +109,39 @@ function parseLawContent(data) {
 
 function parsePrecSearch(data) {
   const s = data?.PrecSearch || {};
-  return toArr(s.prec || s.판례).map(it => ({
-    id:       it.판례정보일련번호 || it.precSeq  || '',
-    court:    it.법원명          || it.courtNm  || '법원',
-    caseNo:   it.사건번호        || it.caseNo   || '',
-    date:     fmt(it.선고일자    || it.judmnAdjYd || ''),
-    caseName: it.사건명          || it.caseNm   || '',
-    summary:  it.판결요지        || it.abstrct  || it.판시사항 || '',
+  const items = toArr(s.prec || s.판례);
+  console.log('[판례 검색 항목 샘플]', items[0]);
+  return items.map(it => ({
+    // 법제처 JSON은 한글 키 사용
+    id:       String(it.판례정보일련번호 || it.precSeq || ''),
+    court:    it.법원명   || it.courtNm  || '법원',
+    caseNo:   it.사건번호 || it.caseNo   || '',
+    date:     fmt(it.선고일자 || it.judmnAdjYd || ''),
+    caseName: it.사건명   || it.caseNm   || '',
+    summary:  it.판결요지 || it.abstrct  || it.판시사항 || '',
   }));
 }
 
+// 판례 상세: 가능한 모든 필드 시도
 function parsePrecDetail(data) {
-  // 법제처 판례 상세 응답에서 전문 추출
-  const s = data?.PrecService || data?.precService || data || {};
-  return s.판례내용 || s.content || s.판결요지 || s.abstrct || s.판시사항 || '';
+  // 여러 루트 키 시도
+  const root = data?.PrecService || data?.precService
+             || data?.법령       || data?.prec
+             || data             || {};
+  console.log('[판례 상세 파싱 root keys]', Object.keys(root));
+
+  return root.판례내용   || root.content
+      || root.판결요지   || root.abstrct
+      || root.판시사항   || root.headnote
+      || root.이유       || root.reason
+      || '';
 }
 
 // ── 공통 UI ───────────────────────────────────────────────────
 function Spinner({ text, small }) {
   return (
-    <div className={`flex ${small ? 'flex-row gap-2 py-2' : 'flex-col items-center justify-center py-12'}`}>
-      <div className={`border-4 border-indigo-100 border-t-indigo-700 rounded-full animate-spin ${small ? 'w-4 h-4' : 'w-9 h-9'}`} />
+    <div className={`flex items-center ${small ? 'gap-2 py-2' : 'flex-col justify-center py-12'}`}>
+      <div className={`border-4 border-indigo-100 border-t-indigo-700 rounded-full animate-spin flex-shrink-0 ${small ? 'w-4 h-4' : 'w-9 h-9'}`} />
       <p className={`text-indigo-700 font-medium ${small ? 'text-xs' : 'mt-3 text-sm'}`}>{text}</p>
     </div>
   );
@@ -211,21 +238,19 @@ function LawCard({ law, isSelected, onClick }) {
   );
 }
 
-// ── 조문 뷰 (targetNo: 자동 펼칠 조문 번호) ───────────────────
+// ── 조문 뷰 ──────────────────────────────────────────────────
 function ArticlesView({ lawContent, isLoading, targetNo }) {
   const [openIdx, setOpenIdx] = useState(null);
   const targetRef = useRef(null);
 
-  // 조문 번호가 있으면 해당 조문 자동 펼침
   useEffect(() => {
     if (!lawContent?.articles?.length || !targetNo) return;
     const idx = lawContent.articles.findIndex(a =>
-      a.no === `제${targetNo}조` || a.no.replace(/[^0-9]/g, '') === targetNo
+      a.no.replace(/[^0-9]/g, '') === String(targetNo)
     );
     if (idx >= 0) {
       setOpenIdx(idx);
-      // 약간 딜레이 후 스크롤
-      setTimeout(() => targetRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 100);
+      setTimeout(() => targetRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 150);
     }
   }, [lawContent, targetNo]);
 
@@ -246,10 +271,10 @@ function ArticlesView({ lawContent, isLoading, targetNo }) {
         <p className="text-indigo-600 text-xs mt-0.5">총 {lawContent.articles.length}개 조문</p>
       </div>
       {lawContent.articles.map((a, i) => {
-        const isTarget = openIdx === i && targetNo;
+        const isTarget = i === openIdx && !!targetNo;
         return (
           <div key={i} ref={isTarget ? targetRef : null}
-            className={`border rounded-lg overflow-hidden transition-colors ${isTarget ? 'border-indigo-400' : 'border-gray-200'}`}>
+            className={`border rounded-lg overflow-hidden ${isTarget ? 'border-indigo-400' : 'border-gray-200'}`}>
             <button onClick={() => setOpenIdx(openIdx === i ? null : i)}
               className="w-full text-left p-3 bg-white hover:bg-gray-50 transition-colors focus:outline-none">
               <div className="flex items-center justify-between gap-2">
@@ -277,20 +302,25 @@ function ArticlesView({ lawContent, isLoading, targetNo }) {
 // ── 판례 아이템 (펼칠 때 상세 전문 로드) ─────────────────────
 function PrecItem({ prec }) {
   const [open,    setOpen]    = useState(false);
-  const [detail,  setDetail]  = useState(null);
+  const [detail,  setDetail]  = useState(null);  // null = 미로드
   const [loading, setLoading] = useState(false);
 
   async function handleToggle() {
     const next = !open;
     setOpen(next);
     if (next && detail === null) {
+      if (!prec.id) {
+        setDetail('판례 ID가 없어 내용을 불러올 수 없습니다.');
+        return;
+      }
       setLoading(true);
       try {
         const data = await apiDetail(prec.id, 'prec');
-        console.log('[판례 상세]', data);
-        setDetail(parsePrecDetail(data) || prec.summary || '내용 없음');
-      } catch {
-        setDetail(prec.summary || '내용을 불러올 수 없습니다.');
+        const content = parsePrecDetail(data);
+        setDetail(content || '판례 전문이 제공되지 않습니다.');
+      } catch (e) {
+        console.error('[판례 상세 오류]', e);
+        setDetail(`오류: ${e.message || '불러오기 실패'}`);
       } finally {
         setLoading(false);
       }
@@ -304,8 +334,8 @@ function PrecItem({ prec }) {
           <div className="flex-1 min-w-0">
             <div className="flex flex-wrap items-center gap-1.5 mb-1.5">
               <span className="text-xs font-bold px-2 py-0.5 bg-blue-900 text-white rounded">{prec.court}</span>
-              <span className="text-xs text-gray-400">{prec.date}</span>
-              <span className="text-xs text-gray-400 font-mono">{prec.caseNo}</span>
+              {prec.date && <span className="text-xs text-gray-400">{prec.date}</span>}
+              {prec.caseNo && <span className="text-xs text-gray-400 font-mono">{prec.caseNo}</span>}
             </div>
             <p className="text-gray-700 text-sm font-medium line-clamp-2">{prec.caseName}</p>
           </div>
@@ -370,7 +400,7 @@ function App() {
   const [searchErr,     setSearchErr]     = useState(null);
   const [laws,          setLaws]          = useState([]);
   const [hasSearched,   setHasSearched]   = useState(false);
-  const [targetNo,      setTargetNo]      = useState(null); // 자동 펼칠 조문 번호
+  const [targetNo,      setTargetNo]      = useState(null);
 
   const [selectedLaw,   setSelectedLaw]   = useState(null);
   const [lawContent,    setLawContent]    = useState(null);
@@ -406,12 +436,15 @@ function App() {
     setLaws([]); setSelectedLaw(null); setLawContent(null); setPrecs([]);
     try {
       const data = await apiSearch(lawName, 'law');
-      const list = parseLawSearch(data);
-      setLaws(list);
+      const raw  = parseLawSearch(data);
+      // 관련도 순으로 정렬: 정확히 일치 → 시작 일치 → 포함
+      const ranked = rankResults(raw, lawName);
+      setLaws(ranked);
 
-      // 조문 번호가 있으면 첫 번째 법령 자동 선택
-      if (articleNo && list.length > 0) {
-        await loadLaw(list[0]);
+      if (ranked.length > 0) {
+        // 정확히 일치하는 법령 또는 첫 번째 결과 자동 선택
+        const best = ranked.find(l => l.lawName.replace(/\s/g,'') === lawName.replace(/\s/g,'')) || ranked[0];
+        await loadLaw(best);
       }
     } catch (e) {
       setSearchErr(e.message?.includes('Failed to fetch')
