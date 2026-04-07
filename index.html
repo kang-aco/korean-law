@@ -27,16 +27,14 @@ const BASE = 'https://www.law.go.kr/DRF';
 
 async function lawSearch(query, target = 'law') {
   const url = `${BASE}/lawSearch.do?OC=${OC}&target=${target}&type=JSON&query=${encodeURIComponent(query)}&display=20&page=1`;
-  console.log('[법제처 요청]', url);
   const res  = await fetch(url);
   const data = await res.json();
-  console.log('[법제처 응답]', data);
+  console.log('[법제처 검색 응답]', data);
   return data;
 }
 
 async function lawDetail(id, target = 'law') {
   const url = `${BASE}/lawService.do?OC=${OC}&target=${target}&ID=${id}&type=JSON`;
-  console.log('[법제처 상세 요청]', url);
   const res  = await fetch(url);
   const data = await res.json();
   console.log('[법제처 상세 응답]', data);
@@ -52,50 +50,58 @@ function fmt(d) {
 }
 function toArr(v) { if (!v) return []; return Array.isArray(v) ? v : [v]; }
 
-// ── 파싱 ─────────────────────────────────────────────────────
+// ── 파싱 (법제처 JSON은 영문 키 사용) ────────────────────────
 function parseLawSearch(data) {
-  return toArr(data?.LawSearch?.법령).map(it => ({
-    id:       it.법령ID,
-    lawName:  it.법령명한글 || '(법령명 없음)',
-    lawType:  it.법령구분  || '',
-    ministry: it.소관부처명 || '',
-    date:     fmt(it.시행일자),
-  }));
+  const s     = data?.LawSearch || {};
+  // 법제처 JSON: 'law' 키 (영문), XML 변환 시 '법령' 키 (한글) 둘 다 처리
+  const items = toArr(s.law || s.법령);
+  return items.map(it => ({
+    id:       it.법령ID    || it.lawId    || '',
+    lawName:  it.법령명한글 || it.lawName  || it.name || '(법령명 없음)',
+    lawType:  it.법령구분  || it.lawType  || '',
+    ministry: it.소관부처명 || it.ministry || '',
+    date:     fmt(it.시행일자 || it.date || ''),
+  })).filter(it => it.id);
 }
 
 function buildContent(a) {
-  const 항list = toArr(a.항);
+  const 항list = toArr(a.항 || a.paragraph);
   if (항list.length) {
     return 항list.map(h => {
-      let t = h.항내용 || '';
-      const 호list = toArr(h.호);
-      if (호list.length) t += '\n' + 호list.map(g => `  ${g.호번호 || ''}. ${g.호내용 || ''}`).join('\n');
+      let t = h.항내용 || h.content || '';
+      const 호list = toArr(h.호 || h.subparagraph);
+      if (호list.length) t += '\n' + 호list.map(g => `  ${g.호번호 || g.no || ''}. ${g.호내용 || g.content || ''}`).join('\n');
       return t;
     }).filter(Boolean).join('\n');
   }
-  return a.조문내용 || '';
+  return a.조문내용 || a.content || '';
 }
 
 function parseLawContent(data) {
-  const basic = data?.법령?.기본정보 || {};
+  const law   = data?.법령 || data?.law || {};
+  const basic = law.기본정보 || law.basicInfo || {};
+  const 조문  = law.조문    || law.article   || {};
   return {
-    lawName:  basic.법령명_한글 || basic.법령명한글 || '',
-    articles: toArr(data?.법령?.조문?.조문단위).map(a => ({
-      no:      a.조문번호 ? `제${a.조문번호}조` : '',
-      title:   a.조문제목 || '',
+    lawName:  basic.법령명_한글 || basic.법령명한글 || basic.lawName || '',
+    articles: toArr(조문.조문단위 || 조문.unit).map(a => ({
+      no:      a.조문번호 ? `제${a.조문번호}조` : (a.articleNo ? `제${a.articleNo}조` : ''),
+      title:   a.조문제목 || a.title   || '',
       content: buildContent(a),
     })),
   };
 }
 
 function parsePrecSearch(data) {
-  return toArr(data?.PrecSearch?.판례).map(it => ({
-    id:       it.판례정보일련번호,
-    court:    it.법원명   || '법원',
-    caseNo:   it.사건번호 || '',
-    date:     fmt(it.선고일자),
-    caseName: it.사건명  || '',
-    summary:  it.판결요지 || it.판시사항 || '',
+  const s     = data?.PrecSearch || {};
+  // 법제처 JSON: 'prec' 키 (영문), XML 변환 시 '판례' 키 (한글) 둘 다 처리
+  const items = toArr(s.prec || s.판례);
+  return items.map(it => ({
+    id:       it.판례정보일련번호 || it.precSeq  || '',
+    court:    it.법원명          || it.courtNm  || '법원',
+    caseNo:   it.사건번호        || it.caseNo   || '',
+    date:     fmt(it.선고일자    || it.judmnAdjYd || ''),
+    caseName: it.사건명          || it.caseNm   || '',
+    summary:  it.판결요지        || it.abstrct  || it.판시사항 || '',
   }));
 }
 
@@ -355,9 +361,8 @@ function App() {
       const data = await lawSearch(term, 'law');
       setLaws(parseLawSearch(data));
     } catch (e) {
-      console.error('[검색 오류]', e);
       setSearchErr(e.message?.includes('Failed to fetch')
-        ? 'CORS 오류: 법제처 API에 직접 접근이 차단되었습니다.'
+        ? 'CORS 오류: 브라우저에서 법제처 API 접근이 차단되었습니다.'
         : (e.message || '검색 중 오류가 발생했습니다.'));
     } finally {
       setIsSearching(false);
@@ -417,9 +422,9 @@ function App() {
               </svg>
               검색 결과
             </h2>
-            {isSearching      ? <Spinner text="법령을 검색하고 있습니다..." /> :
-             searchErr        ? <ErrMsg msg={searchErr} onRetry={() => handleSearch()} /> :
-             !hasSearched     ? <Empty query="" onQuickSearch={handleQuickSearch} /> :
+            {isSearching       ? <Spinner text="법령을 검색하고 있습니다..." /> :
+             searchErr         ? <ErrMsg msg={searchErr} onRetry={() => handleSearch()} /> :
+             !hasSearched      ? <Empty query="" onQuickSearch={handleQuickSearch} /> :
              laws.length === 0 ? <Empty query={query} onQuickSearch={handleQuickSearch} /> :
              <div className="space-y-2">
                <p className="text-xs text-gray-400">총 <strong className="text-gray-600">{laws.length}건</strong></p>
