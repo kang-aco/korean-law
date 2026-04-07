@@ -120,17 +120,13 @@ function parseLawContent(data) {
 function parsePrecSearch(data) {
   const s = data?.PrecSearch || {};
   const items = toArr(s.prec || s.판례);
-  if (items[0]) {
-    console.log('[판례 검색 아이템 전체 키]', Object.keys(items[0]));
-    console.log('[판례 검색 아이템 샘플]', JSON.stringify(items[0]));
-  }
   return items.map(it => ({
-    id:       String(it.판례정보일련번호 || it.precSeq || it.판례ID || it.precId || it.일련번호 || it.seq || ''),
-    court:    it.법원명   || it.courtNm  || '법원',
-    caseNo:   it.사건번호 || it.caseNo   || '',
-    date:     fmt(it.선고일자 || it.judmnAdjYd || ''),
-    caseName: it.사건명   || it.caseNm   || '',
-    summary:  it.판결요지 || it.abstrct  || it.판시사항 || '',
+    id:       String(it.판례일련번호 || it.판례정보일련번호 || ''),
+    court:    it.법원명 || it.데이터출처명 || '법원',
+    caseNo:   it.사건번호 || '',
+    date:     fmt(it.선고일자 || ''),
+    caseName: it.사건명 || '',
+    summary:  it.판결요지 || it.판시사항 || '',
   }));
 }
 
