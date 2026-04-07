@@ -59,6 +59,17 @@ function rankResults(list, target) {
   });
 }
 
+// ── 조문 검색 시 관련 없는 법령 필터 ─────────────────────────
+function filterForArticle(list, lawName) {
+  const t = lawName.replace(/\s/g, '');
+  // 정확히 일치하거나 시작하는 것만
+  const close = list.filter(l => {
+    const n = l.lawName.replace(/\s/g, '');
+    return n === t || n.startsWith(t) || t.startsWith(n);
+  });
+  return close.length > 0 ? close : list.slice(0, 1);
+}
+
 // ── 유틸리티 ─────────────────────────────────────────────────
 function fmt(d) {
   if (!d) return '';
@@ -112,7 +123,6 @@ function parsePrecSearch(data) {
   const items = toArr(s.prec || s.판례);
   console.log('[판례 검색 항목 샘플]', items[0]);
   return items.map(it => ({
-    // 법제처 JSON은 한글 키 사용
     id:       String(it.판례정보일련번호 || it.precSeq || ''),
     court:    it.법원명   || it.courtNm  || '법원',
     caseNo:   it.사건번호 || it.caseNo   || '',
@@ -124,12 +134,11 @@ function parsePrecSearch(data) {
 
 // 판례 상세: 가능한 모든 필드 시도
 function parsePrecDetail(data) {
-  // 여러 루트 키 시도
   const root = data?.PrecService || data?.precService
              || data?.법령       || data?.prec
              || data             || {};
   console.log('[판례 상세 파싱 root keys]', Object.keys(root));
-
+  // 판례내용이 가장 완전한 전문, 없으면 판결요지, 없으면 판시사항
   return root.판례내용   || root.content
       || root.판결요지   || root.abstrct
       || root.판시사항   || root.headnote
@@ -302,7 +311,7 @@ function ArticlesView({ lawContent, isLoading, targetNo }) {
 // ── 판례 아이템 (펼칠 때 상세 전문 로드) ─────────────────────
 function PrecItem({ prec }) {
   const [open,    setOpen]    = useState(false);
-  const [detail,  setDetail]  = useState(null);  // null = 미로드
+  const [detail,  setDetail]  = useState(null);
   const [loading, setLoading] = useState(false);
 
   async function handleToggle() {
@@ -437,13 +446,14 @@ function App() {
     try {
       const data = await apiSearch(lawName, 'law');
       const raw  = parseLawSearch(data);
-      // 관련도 순으로 정렬: 정확히 일치 → 시작 일치 → 포함
       const ranked = rankResults(raw, lawName);
-      setLaws(ranked);
 
-      if (ranked.length > 0) {
-        // 정확히 일치하는 법령 또는 첫 번째 결과 자동 선택
-        const best = ranked.find(l => l.lawName.replace(/\s/g,'') === lawName.replace(/\s/g,'')) || ranked[0];
+      // 조문 번호가 지정된 경우 관련 없는 법령 필터링
+      const displayed = articleNo ? filterForArticle(ranked, lawName) : ranked;
+      setLaws(displayed);
+
+      if (displayed.length > 0) {
+        const best = displayed.find(l => l.lawName.replace(/\s/g,'') === lawName.replace(/\s/g,'')) || displayed[0];
         await loadLaw(best);
       }
     } catch (e) {
